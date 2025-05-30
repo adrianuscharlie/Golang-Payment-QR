@@ -17,9 +17,12 @@ func RegisterRoutes(router *gin.Engine, db *gorm.DB) {
 	cancelOrderService := services.NewCancelOrderService(transactionRepository, tracelogRepository, productRepository)
 	paymentService := services.NewPaymentService(productRepository, transactionRepository, tracelogRepository, queryService, cancelOrderService)
 	paymentHandler := handler.NewPaymenthandler(paymentService, tracelogRepository)
-
+	queryPaymentHandler := handler.NewQueryPaymentHandler(queryService, tracelogRepository)
+	cancelOrderHandler := handler.NewCancelOrderHandler(cancelOrderService, tracelogRepository)
 	api := router.Group("/api")
 	{
 		api.POST("/qris/payment", paymentHandler.HandleCPMPayment)
+		api.POST("/qris/payment/status", queryPaymentHandler.HandleCheckStatus)
+		api.POST("/qris/payment/cancel", cancelOrderHandler.CancelOrder)
 	}
 }
