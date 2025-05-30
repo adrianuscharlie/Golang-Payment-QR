@@ -14,7 +14,8 @@ func RegisterRoutes(router *gin.Engine, db *gorm.DB) {
 	transactionRepository := repository.NewTransactionRepository(db)
 	tracelogRepository := repository.NewTracelogRepository(db)
 	queryService := services.NewQueryPaymentService(transactionRepository, tracelogRepository, productRepository)
-	paymentService := services.NewPaymentService(productRepository, transactionRepository, tracelogRepository, queryService)
+	cancelOrderService := services.NewCancelOrderService(transactionRepository, tracelogRepository, productRepository)
+	paymentService := services.NewPaymentService(productRepository, transactionRepository, tracelogRepository, queryService, cancelOrderService)
 	paymentHandler := handler.NewPaymenthandler(paymentService, tracelogRepository)
 
 	api := router.Group("/api")

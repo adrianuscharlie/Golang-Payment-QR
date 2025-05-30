@@ -1,12 +1,8 @@
 package services
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"qr-payment/dummy"
 	"qr-payment/model"
 	"qr-payment/repository"
 	"qr-payment/request"
@@ -25,27 +21,53 @@ type paymentService struct {
 	transactionRepo     repository.TransactionRepository
 	tracelogRepo        repository.TracelogRepository
 	queryPaymentService QueryPaymentService
+	cancelOrderService  CancelOrderService
 }
 
-func NewPaymentService(productRepo repository.ProductConfigRepository, transactionRepo repository.TransactionRepository, tracelogRepo repository.TracelogRepository, queryPaymentService QueryPaymentService) PaymentService {
-	return &paymentService{productRepo, transactionRepo, tracelogRepo, queryPaymentService}
+func NewPaymentService(productRepo repository.ProductConfigRepository, transactionRepo repository.TransactionRepository, tracelogRepo repository.TracelogRepository, queryPaymentService QueryPaymentService, cancelOrderService CancelOrderService) PaymentService {
+	return &paymentService{productRepo, transactionRepo, tracelogRepo, queryPaymentService, cancelOrderService}
 }
+func (s *paymentService) logAndWrapError(trxId, message, stage string, err error) error {
+	s.tracelogRepo.Log(trxId, message+": "+err.Error(), stage)
+	return fmt.Errorf("%s: %w", message, err)
+}
+
+func (s *paymentService) cancelOrderAndRespond(trxId string, merchantId string, productCode string) *response.CreatePaymentResponse {
+	s.tracelogRepo.Log(trxId, "Triggering Cancel Order To Partner", "SEND HTTP POST")
+	_, err := s.cancelOrderService.CancelOrder(trxId, merchantId, productCode)
+	if err != nil {
+		s.tracelogRepo.Log(trxId, "Failed cancel order: "+err.Error(), "Cancel Order")
+	}
+	return &response.CreatePaymentResponse{
+		TrxId:           trxId,
+		TrxConfirm:      "",
+		ResponseCode:    "21",
+		ResponseMessage: "Order was canceled because payment failed!",
+	}
+}
+
+const (
+	defaultMerchantID     = "TP18"
+	defaultStoreID        = "M2351"
+	defaultQrContentType  = "BAR_CODE"
+	defaultSourcePlatform = "IPG"
+	defaultOrderTerminal  = "WEB"
+)
 
 func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.CreatePaymentResponse, error) {
+	var paymentResponse response.CreatePaymentResponse
 	s.tracelogRepo.Log(req.TrxId, "Transaction Received with TrxId: "+req.TrxId, "Service IN")
 	timeStamp := time.Now().Add(5 * time.Minute).Format(time.RFC3339)
-	// Get Product Configuration
+
 	productConfig, err := s.productRepo.GetConfig(req.ProductCode)
 	if err != nil {
-		s.tracelogRepo.Log(req.TrxId, "Error Get Product Config : "+err.Error(), "Product Config")
-		return nil, err
+		return nil, s.logAndWrapError(req.TrxId, "Error Get Product Config", "Product Config", err)
 	}
 	urlConfig, err := s.productRepo.GetUrlConfig(req.ProductCode, "PAYMENT")
 	if err != nil {
-		s.tracelogRepo.Log(req.TrxId, "Error Get URL for Product Code: "+req.ProductCode, "URL Config")
-		return nil, err
+		return nil, s.logAndWrapError(req.TrxId, "Error Get URL for Product Code: "+req.ProductCode, "URL Config", err)
 	}
-	// Create request requirements
+
 	paymentRequest := request.PaymentRequest{
 		PartnerReferenceNo: req.TrxId,
 		QrContent:          req.QrContent,
@@ -53,41 +75,29 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 			Value:    strconv.Itoa(int(req.Amount)),
 			Currency: "IDR",
 		},
-		MerchantId:      "TP18",
+		MerchantId:      defaultMerchantID,
 		Title:           "QRIS CPM Payment via Dana",
 		ExpiryTime:      timeStamp,
-		ExternalStoreId: "M2351",
+		ExternalStoreId: defaultStoreID,
 		ScannerInfo: request.ScannerInfo{
 			DeviceId: "46252",
 			DeviceIp: "172.24.281.24",
 		},
 		AdditionnalInfo: request.AdditionnalInfo{
-			QrContentType: "BAR_CODE",
+			QrContentType: defaultQrContentType,
 			Mcc:           "5732",
 			ProductCode:   req.ProductCode,
 			Envinfo: request.Envinfo{
-				SourcePplatform:   "IPG",
+				SourcePplatform:   defaultSourcePlatform,
 				TerminalType:      "SYSTEM",
-				OrderterminalType: "WEB",
+				OrderterminalType: defaultOrderTerminal,
 			},
 		},
 	}
 
 	jsonData, err := json.Marshal(paymentRequest)
 	if err != nil {
-		s.tracelogRepo.Log(req.TrxId, "Error Creating Request and Serialize into JSON ", "Create Request")
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	httpReq, err := http.NewRequest("POST", urlConfig.Url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	signature, err := utils.SignatureHeader(productConfig.ClientSecret, timeStamp)
-	if err != nil {
-		s.tracelogRepo.Log(req.TrxId, "Failed Creating Signature Header for Request", "Signature")
-		return nil, fmt.Errorf("failed to create Signature request: %w", err)
+		return nil, s.logAndWrapError(req.TrxId, "Error Creating Request and Serialize into JSON ", "Create Request", err)
 	}
 
 	transaction := model.Transaction{
@@ -102,54 +112,42 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 	}
 	err = s.transactionRepo.Insert(&transaction)
 	if err != nil {
-		s.tracelogRepo.Log(req.TrxId, "Error Insert transaction into table transaction", "Signature")
-		return nil, err
+		return nil, s.logAndWrapError(req.TrxId, "Error Insert transaction into table transaction", "Insert Transaction", err)
+	}
+	meta := utils.RequestMeta{
+		ClientSecret: productConfig.ClientSecret,
+		ExtraParam1:  productConfig.ExtraParam1,
+		ExtraParam2:  productConfig.ExtraParam2,
+		ExtraParam3:  productConfig.ExtraParam3,
+		Token:        "your-token-here",
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-TIMESTAMP", timeStamp)
-	httpReq.Header.Set("X-PARTNER-ID", productConfig.ExtraParam1)
-	httpReq.Header.Set("X-EXTERNAL-ID", productConfig.ExtraParam2)
-	httpReq.Header.Set("CHANNEL-ID", productConfig.ExtraParam3)
-	httpReq.Header.Set("Authorization", "Bearer your-token-here")
-	httpReq.Header.Set("X-SIGNATURE", signature)
-
-	var headerStr string
-	for key, values := range httpReq.Header {
-		for _, value := range values {
-			headerStr += key + ":" + value + "\n"
-		}
-	}
-	s.tracelogRepo.Log(req.TrxId, "Sending HTTP POST : \n"+headerStr+"\n"+string(jsonData), "SEND HTTP POST")
-	// Send Request to Partner
-	client := &http.Client{}
-	res, err := client.Do(httpReq)
+	body, headerStr, err := utils.SendRequest("POST", urlConfig.Url, paymentRequest, meta)
 	if err != nil {
 		s.tracelogRepo.Log(req.TrxId, "Error Sending HTTP POST :"+err.Error(), "SEND HTTP POST")
-		return nil, fmt.Errorf("failed to send request: %w", err)
+		s.tracelogRepo.Log(req.TrxId, "Triggering Cancel Order To Partner :"+err.Error(), "SEND HTTP POST")
+		paymentResponse = *s.cancelOrderAndRespond(paymentRequest.PartnerReferenceNo, paymentRequest.MerchantId, req.ProductCode)
+		transaction.ResponseCode = paymentResponse.ResponseCode
+		transaction.ResponseMessage = paymentResponse.ResponseMessage
+		transaction.ReversalCode = paymentResponse.ResponseCode
+		transaction.ReversalMessage = paymentResponse.ResponseMessage
+		transaction.ReversalDate = time.Now()
+		s.transactionRepo.Update(&transaction)
+		return &paymentResponse, nil
 	}
-	defer res.Body.Close()
-
-	body, err := io.ReadAll(res.Body)
+	err = json.Unmarshal(body, &paymentResponse)
 	if err != nil {
-		fmt.Println(body)
-		s.tracelogRepo.Log(req.TrxId, "Error :Parse response Body :"+err.Error(), "Parse Response")
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, s.logAndWrapError(req.TrxId, "failed to unmarshal response", "Deserialize Json", err)
 	}
-	partnerResponse := dummy.DummyPaymentResponse(paymentRequest)
-	resJson, err := json.Marshal(partnerResponse)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal response: %w", err)
-	}
-	s.tracelogRepo.Log(req.TrxId, "Response String :"+string(resJson), "Response String")
-	transaction.Response = string(resJson)
+	var partnerResponse response.PaymentResponse
+	s.tracelogRepo.Log(partnerResponse.PartnerReferenceNo, "Sending HTTP POST : \n"+headerStr+"\n"+string(body), "SEND HTTP POST")
+	transaction.Response = string(body)
 	transaction.ResponseCode = partnerResponse.ResponseCode
 	transaction.ResponseMessage = partnerResponse.ResponseMessage
 	transaction.TrxConfirm = partnerResponse.ReferenceNo
-	var paymentResponse response.CreatePaymentResponse
 
-	// Handle pending state that requires a query to determine final status
 	if partnerResponse.ResponseCode == "2026000" {
+		s.tracelogRepo.Log(req.TrxId, "Transaction pending, check status payment to Partner", "CHECK STATUS")
 		checkStatus, err := s.queryPaymentService.CheckStatusPayment(
 			partnerResponse.PartnerReferenceNo,
 			partnerResponse.ReferenceNo,
@@ -157,7 +155,16 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 			req.ProductCode,
 		)
 		if err != nil {
-			return nil, err
+			s.tracelogRepo.Log(req.TrxId, "Error Sending HTTP POST :"+err.Error(), "SEND HTTP POST")
+			s.tracelogRepo.Log(req.TrxId, "Triggering Cancel Order To Partner :"+err.Error(), "SEND HTTP POST")
+			paymentResponse = *s.cancelOrderAndRespond(paymentRequest.PartnerReferenceNo, paymentRequest.MerchantId, req.ProductCode)
+			transaction.ResponseCode = paymentResponse.ResponseCode
+			transaction.ResponseMessage = paymentResponse.ResponseMessage
+			transaction.ReversalCode = paymentResponse.ResponseCode
+			transaction.ReversalMessage = paymentResponse.ResponseMessage
+			transaction.ReversalDate = time.Now()
+			s.transactionRepo.Update(&transaction)
+			return &paymentResponse, nil
 		}
 
 		if checkStatus.ResponseCode == "2005500" {
@@ -184,7 +191,6 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 				PaidAt:          checkStatus.PaidTime,
 			}
 		} else {
-			// If check status fails but we must still return something
 			transaction.ResponseCode = partnerResponse.ResponseCode
 			transaction.ResponseMessage = partnerResponse.ResponseMessage
 
@@ -197,10 +203,9 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 			}
 		}
 	} else {
-		// Directly use CPM response if it's already final (00, 05, etc.)
+
 		transaction.ResponseCode = partnerResponse.ResponseCode
 		transaction.ResponseMessage = partnerResponse.ResponseMessage
-
 		paymentResponse = response.CreatePaymentResponse{
 			TrxId:           req.TrxId,
 			TrxConfirm:      partnerResponse.ReferenceNo,
@@ -210,17 +215,11 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 		}
 	}
 
-	// Try to update the transaction
 	err = s.transactionRepo.Update(&transaction)
 	if err != nil {
-		s.tracelogRepo.Log(req.TrxId,
-			"Error Update Transaction with RC:"+transaction.ResponseCode+" Response Message:"+transaction.ResponseMessage+" Error: "+err.Error(),
-			"Update Transaction",
-		)
-		return nil, err
+		return nil, s.logAndWrapError(req.TrxId, "Error Update Transaction with RC:"+transaction.ResponseCode+" Response Message:"+transaction.ResponseMessage, "Update Transaction", err)
 	}
 
-	// Final exit log
 	s.tracelogRepo.Log(req.TrxId,
 		"Transaction Exit "+paymentResponse.ResponseCode+";"+paymentResponse.ResponseMessage,
 		"Service EXIT",
