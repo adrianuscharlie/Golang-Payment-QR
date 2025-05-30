@@ -21,26 +21,30 @@ type PaymentService interface {
 }
 
 type paymentService struct {
-	productRepo     repository.ProductConfigRepository
-	transactionRepo repository.TransactionRepository
+	productRepo         repository.ProductConfigRepository
+	transactionRepo     repository.TransactionRepository
+	tracelogRepo        repository.TracelogRepository
+	queryPaymentService QueryPaymentService
 }
 
-func NewPaymentService(productRepo repository.ProductConfigRepository, transactionRepo repository.TransactionRepository) PaymentService {
-	return &paymentService{productRepo, transactionRepo}
+func NewPaymentService(productRepo repository.ProductConfigRepository, transactionRepo repository.TransactionRepository, tracelogRepo repository.TracelogRepository, queryPaymentService QueryPaymentService) PaymentService {
+	return &paymentService{productRepo, transactionRepo, tracelogRepo, queryPaymentService}
 }
 
 func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.CreatePaymentResponse, error) {
+	s.tracelogRepo.Log(req.TrxId, "Transaction Received with TrxId: "+req.TrxId, "Service IN")
 	timeStamp := time.Now().Add(5 * time.Minute).Format(time.RFC3339)
 	// Get Product Configuration
 	productConfig, err := s.productRepo.GetConfig(req.ProductCode)
 	if err != nil {
+		s.tracelogRepo.Log(req.TrxId, "Error Get Product Config : "+err.Error(), "Product Config")
 		return nil, err
 	}
-	urlConfig, err := s.productRepo.GetUrlConfig(req.ProductCode)
+	urlConfig, err := s.productRepo.GetUrlConfig(req.ProductCode, "PAYMENT")
 	if err != nil {
+		s.tracelogRepo.Log(req.TrxId, "Error Get URL for Product Code: "+req.ProductCode, "URL Config")
 		return nil, err
 	}
-
 	// Create request requirements
 	paymentRequest := request.PaymentRequest{
 		PartnerReferenceNo: req.TrxId,
@@ -71,6 +75,7 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 
 	jsonData, err := json.Marshal(paymentRequest)
 	if err != nil {
+		s.tracelogRepo.Log(req.TrxId, "Error Creating Request and Serialize into JSON ", "Create Request")
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
@@ -81,6 +86,7 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 
 	signature, err := utils.SignatureHeader(productConfig.ClientSecret, timeStamp)
 	if err != nil {
+		s.tracelogRepo.Log(req.TrxId, "Failed Creating Signature Header for Request", "Signature")
 		return nil, fmt.Errorf("failed to create Signature request: %w", err)
 	}
 
@@ -96,6 +102,7 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 	}
 	err = s.transactionRepo.Insert(&transaction)
 	if err != nil {
+		s.tracelogRepo.Log(req.TrxId, "Error Insert transaction into table transaction", "Signature")
 		return nil, err
 	}
 
@@ -107,10 +114,18 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 	httpReq.Header.Set("Authorization", "Bearer your-token-here")
 	httpReq.Header.Set("X-SIGNATURE", signature)
 
+	var headerStr string
+	for key, values := range httpReq.Header {
+		for _, value := range values {
+			headerStr += key + ":" + value + "\n"
+		}
+	}
+	s.tracelogRepo.Log(req.TrxId, "Sending HTTP POST : \n"+headerStr+"\n"+string(jsonData), "SEND HTTP POST")
 	// Send Request to Partner
 	client := &http.Client{}
 	res, err := client.Do(httpReq)
 	if err != nil {
+		s.tracelogRepo.Log(req.TrxId, "Error Sending HTTP POST :"+err.Error(), "SEND HTTP POST")
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer res.Body.Close()
@@ -118,6 +133,7 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		fmt.Println(body)
+		s.tracelogRepo.Log(req.TrxId, "Error :Parse response Body :"+err.Error(), "Parse Response")
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 	partnerResponse := dummy.DummyPaymentResponse(paymentRequest)
@@ -125,19 +141,90 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal response: %w", err)
 	}
+	s.tracelogRepo.Log(req.TrxId, "Response String :"+string(resJson), "Response String")
 	transaction.Response = string(resJson)
 	transaction.ResponseCode = partnerResponse.ResponseCode
 	transaction.ResponseMessage = partnerResponse.ResponseMessage
 	transaction.TrxConfirm = partnerResponse.ReferenceNo
-	s.transactionRepo.Update(&transaction)
+	var paymentResponse response.CreatePaymentResponse
 
-	paymentResponse := response.CreatePaymentResponse{
-		TrxId:           req.TrxId,
-		TrxConfirm:      partnerResponse.ReferenceNo,
-		ResponseCode:    partnerResponse.ResponseCode,
-		ResponseMessage: partnerResponse.ResponseMessage,
-		PaidAt:          partnerResponse.AdditionnalInfo.PaidTime,
+	// Handle pending state that requires a query to determine final status
+	if partnerResponse.ResponseCode == "2026000" {
+		checkStatus, err := s.queryPaymentService.CheckStatusPayment(
+			partnerResponse.PartnerReferenceNo,
+			partnerResponse.ReferenceNo,
+			paymentRequest.MerchantId,
+			req.ProductCode,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if checkStatus.ResponseCode == "2005500" {
+			switch checkStatus.LatestTransactionStatus {
+			case "00":
+				transaction.ResponseCode = "00"
+				transaction.ResponseMessage = "SUCCESS"
+			case "05":
+				transaction.ResponseCode = "2005505"
+				transaction.ResponseMessage = "FAILED"
+			case "02":
+				transaction.ResponseCode = "2005502"
+				transaction.ResponseMessage = "PENDING"
+			default:
+				transaction.ResponseCode = "99"
+				transaction.ResponseMessage = "UNKNOWN STATUS"
+			}
+
+			paymentResponse = response.CreatePaymentResponse{
+				TrxId:           req.TrxId,
+				TrxConfirm:      partnerResponse.ReferenceNo,
+				ResponseCode:    transaction.ResponseCode,
+				ResponseMessage: transaction.ResponseMessage,
+				PaidAt:          checkStatus.PaidTime,
+			}
+		} else {
+			// If check status fails but we must still return something
+			transaction.ResponseCode = partnerResponse.ResponseCode
+			transaction.ResponseMessage = partnerResponse.ResponseMessage
+
+			paymentResponse = response.CreatePaymentResponse{
+				TrxId:           req.TrxId,
+				TrxConfirm:      partnerResponse.ReferenceNo,
+				ResponseCode:    transaction.ResponseCode,
+				ResponseMessage: transaction.ResponseMessage,
+				PaidAt:          partnerResponse.AdditionnalInfo.PaidTime,
+			}
+		}
+	} else {
+		// Directly use CPM response if it's already final (00, 05, etc.)
+		transaction.ResponseCode = partnerResponse.ResponseCode
+		transaction.ResponseMessage = partnerResponse.ResponseMessage
+
+		paymentResponse = response.CreatePaymentResponse{
+			TrxId:           req.TrxId,
+			TrxConfirm:      partnerResponse.ReferenceNo,
+			ResponseCode:    transaction.ResponseCode,
+			ResponseMessage: transaction.ResponseMessage,
+			PaidAt:          partnerResponse.AdditionnalInfo.PaidTime,
+		}
 	}
+
+	// Try to update the transaction
+	err = s.transactionRepo.Update(&transaction)
+	if err != nil {
+		s.tracelogRepo.Log(req.TrxId,
+			"Error Update Transaction with RC:"+transaction.ResponseCode+" Response Message:"+transaction.ResponseMessage+" Error: "+err.Error(),
+			"Update Transaction",
+		)
+		return nil, err
+	}
+
+	// Final exit log
+	s.tracelogRepo.Log(req.TrxId,
+		"Transaction Exit "+paymentResponse.ResponseCode+";"+paymentResponse.ResponseMessage,
+		"Service EXIT",
+	)
 
 	return &paymentResponse, nil
 }

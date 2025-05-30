@@ -12,8 +12,10 @@ import (
 func RegisterRoutes(router *gin.Engine, db *gorm.DB) {
 	productRepository := repository.NewProductConfigRepository(db)
 	transactionRepository := repository.NewTransactionRepository(db)
-	paymentService := services.NewPaymentService(productRepository, transactionRepository)
-	paymentHandler := handler.NewPaymenthandler(paymentService)
+	tracelogRepository := repository.NewTracelogRepository(db)
+	queryService := services.NewQueryPaymentService(transactionRepository, tracelogRepository, productRepository)
+	paymentService := services.NewPaymentService(productRepository, transactionRepository, tracelogRepository, queryService)
+	paymentHandler := handler.NewPaymenthandler(paymentService, tracelogRepository)
 
 	api := router.Group("/api")
 	{

@@ -21,7 +21,8 @@ func main() {
 	config.ConnectDB()
 	config.DB.AutoMigrate(&model.ProductConfig{},
 		&model.UrlConfig{},
-		&model.Transaction{})
+		&model.Transaction{},
+		&model.Tracelog{})
 	r := gin.Default()
 	routes.RegisterRoutes(r, config.DB)
 	r.Run(":8080")

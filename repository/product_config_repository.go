@@ -8,7 +8,7 @@ import (
 
 type ProductConfigRepository interface {
 	GetConfig(productCode string) (*model.ProductConfig, error)
-	GetUrlConfig(productCode string) (*model.UrlConfig, error)
+	GetUrlConfig(productCode string, trxType string) (*model.UrlConfig, error)
 }
 
 type productRepository struct {
@@ -25,8 +25,9 @@ func (r *productRepository) GetConfig(productCode string) (*model.ProductConfig,
 	return &productConfig, err
 }
 
-func (r *productRepository) GetUrlConfig(productCode string) (*model.UrlConfig, error) {
+func (r *productRepository) GetUrlConfig(productCode string, trxType string) (*model.UrlConfig, error) {
 	var urlConfig model.UrlConfig
-	err := r.db.First(&urlConfig, productCode).Error
+	err := r.db.Model(&model.UrlConfig{}).Where("product_code=? AND trx_type=?", productCode, trxType).Error
 	return &urlConfig, err
+
 }
