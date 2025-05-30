@@ -34,7 +34,7 @@ func (s *paymentService) logAndWrapError(trxId, message, stage string, err error
 
 func (s *paymentService) cancelOrderAndRespond(trxId string, merchantId string, productCode string) *response.CreatePaymentResponse {
 	s.tracelogRepo.Log(trxId, "Triggering Cancel Order To Partner", "SEND HTTP POST")
-	_, err := s.cancelOrderService.CancelOrder(trxId, merchantId, productCode)
+	_, err := s.cancelOrderService.CancelOrder(request.CreateCancelOrderRequest{TrxId: trxId, ProductCode: productCode})
 	if err != nil {
 		s.tracelogRepo.Log(trxId, "Failed cancel order: "+err.Error(), "Cancel Order")
 	}
@@ -148,12 +148,7 @@ func (s *paymentService) Payment(req request.CreatePaymentRequest) (*response.Cr
 
 	if partnerResponse.ResponseCode == "2026000" {
 		s.tracelogRepo.Log(req.TrxId, "Transaction pending, check status payment to Partner", "CHECK STATUS")
-		checkStatus, err := s.queryPaymentService.CheckStatusPayment(
-			partnerResponse.PartnerReferenceNo,
-			partnerResponse.ReferenceNo,
-			paymentRequest.MerchantId,
-			req.ProductCode,
-		)
+		checkStatus, err := s.queryPaymentService.CheckStatusPayment(request.CreateQueryPaymentRequest{TrxId: req.TrxId, ProductCode: req.ProductCode})
 		if err != nil {
 			s.tracelogRepo.Log(req.TrxId, "Error Sending HTTP POST :"+err.Error(), "SEND HTTP POST")
 			s.tracelogRepo.Log(req.TrxId, "Triggering Cancel Order To Partner :"+err.Error(), "SEND HTTP POST")

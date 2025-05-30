@@ -10,7 +10,7 @@ import (
 )
 
 type QueryPaymentService interface {
-	CheckStatusPayment(trxId string, referenceNo string, merchantId string, productCode string) (*response.QueryPaymentResponse, error)
+	CheckStatusPayment(request.CreateQueryPaymentRequest) (*response.CreateQueryPaymentResponse, error)
 }
 
 type queryPaymentService struct {
@@ -26,21 +26,23 @@ func (s *queryPaymentService) logAndWrapError(trxId, message, stage string, err 
 	s.tracelogRepo.Log(trxId, message+": "+err.Error(), stage)
 	return fmt.Errorf("%s: %w", message, err)
 }
-func (q queryPaymentService) CheckStatusPayment(trxId string, referenceNo string, merchantId string, productCode string) (*response.QueryPaymentResponse, error) {
+
+func (q queryPaymentService) CheckStatusPayment(req request.CreateQueryPaymentRequest) (*response.CreateQueryPaymentResponse, error) {
+	var responseStatus response.CreateQueryPaymentResponse
 	// Get Product Configuration
-	productConfig, err := q.productRepo.GetConfig(productCode)
+	productConfig, err := q.productRepo.GetConfig(req.ProductCode)
 	if err != nil {
-		return nil, q.logAndWrapError(trxId, "Error Get Product Config", "Product Config", err)
+		return nil, q.logAndWrapError(req.TrxId, "Error Get Product Config", "Product Config", err)
 	}
 	qrStatus := request.QueryPaymentRequest{
-		OriginalPartnerReferenceNo: trxId,
-		OriginalReferenceNo:        referenceNo,
-		MerchantId:                 merchantId,
+		OriginalPartnerReferenceNo: req.TrxId,
+		OriginalReferenceNo:        "",
+		MerchantId:                 defaultMerchantID,
 		ServiceCode:                "60",
 	}
-	urlConfig, err := q.productRepo.GetUrlConfig(productCode, "STATUS")
+	urlConfig, err := q.productRepo.GetUrlConfig(req.ProductCode, "STATUS")
 	if err != nil {
-		return nil, q.logAndWrapError(trxId, "Error Get URL for Product Code: "+productCode, "URL Config", err)
+		return nil, q.logAndWrapError(req.TrxId, "Error Get URL for Product Code: "+req.ProductCode, "URL Config", err)
 	}
 	meta := utils.RequestMeta{
 		ClientSecret: productConfig.ClientSecret,
@@ -52,7 +54,7 @@ func (q queryPaymentService) CheckStatusPayment(trxId string, referenceNo string
 
 	body, headerStr, err := utils.SendRequest("POST", urlConfig.Url, qrStatus, meta)
 	if err != nil {
-		return nil, q.logAndWrapError(trxId, "Error Sending HTTP POST", "SEND HTTP POST", err)
+		return nil, q.logAndWrapError(req.TrxId, "Error Sending HTTP POST", "SEND HTTP POST", err)
 	}
 
 	q.tracelogRepo.Log(qrStatus.OriginalPartnerReferenceNo, "Sending HTTP POST : \n"+headerStr+"\n"+string(body), "SEND HTTP POST")
@@ -60,8 +62,17 @@ func (q queryPaymentService) CheckStatusPayment(trxId string, referenceNo string
 	var qrResponse response.QueryPaymentResponse
 	err = json.Unmarshal(body, &qrResponse)
 	if err != nil {
-		return nil, q.logAndWrapError(trxId, "failed to unmarshal response", "Deserialize Json", err)
+		return nil, q.logAndWrapError(req.TrxId, "failed to unmarshal response", "Deserialize Json", err)
 	}
 
-	return &qrResponse, nil
+	responseStatus = response.CreateQueryPaymentResponse{
+		TrxId:                   req.TrxId,
+		ResponseCode:            qrResponse.ResponseCode,
+		ResponseMessage:         qrResponse.ResponseMessage,
+		LatestTransactionStatus: qrResponse.LatestTransactionStatus,
+		PaidTime:                qrResponse.PaidTime,
+		Amount:                  qrResponse.Amount.Value,
+	}
+
+	return &responseStatus, nil
 }

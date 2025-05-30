@@ -10,7 +10,7 @@ import (
 )
 
 type CancelOrderService interface {
-	CancelOrder(trxid string, merchantId string, productCode string) (*response.CancelOrderResponse, error)
+	CancelOrder(req request.CreateCancelOrderRequest) (*response.CreateCancelOrderResponse, error)
 }
 
 type cancelOrderService struct {
@@ -29,20 +29,20 @@ func (s *cancelOrderService) logAndWrapError(trxId, message, stage string, err e
 	return fmt.Errorf("%s: %w", message, err)
 }
 
-func (c cancelOrderService) CancelOrder(trxId string, merchantId string, productCode string) (*response.CancelOrderResponse, error) {
-	productConfig, err := c.productRepo.GetConfig(productCode)
+func (c cancelOrderService) CancelOrder(req request.CreateCancelOrderRequest) (*response.CreateCancelOrderResponse, error) {
+	productConfig, err := c.productRepo.GetConfig(req.ProductCode)
 	if err != nil {
-		return nil, c.logAndWrapError(trxId, "Error Get Product Config", "Product Config", err)
+		return nil, c.logAndWrapError(req.TrxId, "Error Get Product Config", "Product Config", err)
 	}
 
 	cancel := request.CancelOrderRequest{
-		OriginalPartnerReferenceNo: trxId,
-		MerchantId:                 merchantId,
+		OriginalPartnerReferenceNo: req.TrxId,
+		MerchantId:                 defaultMerchantID,
 	}
 
-	urlConfig, err := c.productRepo.GetUrlConfig(productCode, "CANCEL")
+	urlConfig, err := c.productRepo.GetUrlConfig(req.ProductCode, "CANCEL")
 	if err != nil {
-		return nil, c.logAndWrapError(trxId, "Error Get URL for Product Code: "+productCode, "URL Config", err)
+		return nil, c.logAndWrapError(req.TrxId, "Error Get URL for Product Code: "+req.ProductCode, "URL Config", err)
 	}
 	meta := utils.RequestMeta{
 		ClientSecret: productConfig.ClientSecret,
@@ -54,7 +54,7 @@ func (c cancelOrderService) CancelOrder(trxId string, merchantId string, product
 
 	body, headerStr, err := utils.SendRequest("POST", urlConfig.Url, cancel, meta)
 	if err != nil {
-		return nil, c.logAndWrapError(trxId, "Error Sending HTTP POST", "SEND HTTP POST", err)
+		return nil, c.logAndWrapError(req.TrxId, "Error Sending HTTP POST", "SEND HTTP POST", err)
 	}
 	c.tracelogRepo.Log(cancel.OriginalPartnerReferenceNo, "Sending HTTP POST : \n"+headerStr+"\n"+string(body), "SEND HTTP POST")
 
@@ -62,7 +62,16 @@ func (c cancelOrderService) CancelOrder(trxId string, merchantId string, product
 
 	err = json.Unmarshal(body, &cancelResponse)
 	if err != nil {
-		return nil, c.logAndWrapError(trxId, "failed to unmarshal response", "Deserialize Json", err)
+		return nil, c.logAndWrapError(req.TrxId, "failed to unmarshal response", "Deserialize Json", err)
 	}
-	return &cancelResponse, nil
+
+	cResponse := response.CreateCancelOrderResponse{
+		ResponseCode:    cancelResponse.ResponseCode,
+		ResponseMessage: cancelResponse.ResponseMessage,
+		TrxId:           cancel.OriginalPartnerReferenceNo,
+		CancelTime:      cancelResponse.CancelTime,
+		TransactionDate: cancelResponse.TransactionDate,
+	}
+
+	return &cResponse, nil
 }
